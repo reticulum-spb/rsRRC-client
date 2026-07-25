@@ -32,7 +32,8 @@ println!("{} rooms, {} users", rooms.len(), users.len());
 Every successfully parsed LIST or WHO reply is also published as
 `Event::RoomList` or `Event::UserList`. This is useful for long-running bots
 that need to react to directory refreshes while another component owns the
-request.
+request. The latest results are retained in `Hub::public_rooms` and
+`Hub::room_users` and can be read later through `RrcClient::hub`.
 
 Room administration has typed helpers for registration, topics, room modes
 and keys, operator and voice roles, kicks, invites, and bans. These helpers

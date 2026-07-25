@@ -48,7 +48,9 @@ pub struct Hub {
     pub welcome: Option<Welcome>,
     pub connected: bool,
     pub rooms: Vec<String>,
+    pub public_rooms: Vec<RoomInfo>,
     pub room_states: BTreeMap<String, RoomState>,
+    pub room_users: BTreeMap<String, Vec<UserInfo>>,
     pub detail: String,
 }
 
@@ -1220,7 +1222,9 @@ async fn connect(
             welcome: None,
             connected: true,
             rooms: Vec::new(),
+            public_rooms: Vec::new(),
             room_states: BTreeMap::new(),
+            room_users: BTreeMap::new(),
             detail: "Waiting for WELCOME".into(),
         },
         nick: nick.map(str::to_string),
@@ -1335,6 +1339,7 @@ async fn handle_inbound(
             if let Some(room) = envelope.room() {
                 session.hub.rooms.retain(|value| value != room);
                 session.hub.room_states.remove(room);
+                session.hub.room_users.remove(room);
             }
             let _ = channels.events.send(Event::HubChanged(session.hub.clone()));
         }
@@ -1458,10 +1463,12 @@ fn resolve_query_notice(
     structured_users: Option<Vec<UserInfo>>,
 ) -> bool {
     if let Some(rooms) = parse_room_list_notice(body) {
+        session.hub.public_rooms = rooms.clone();
         let _ = events.send(Event::RoomList {
             hub,
             rooms: rooms.clone(),
         });
+        let _ = events.send(Event::HubChanged(session.hub.clone()));
         if let Some((_, response)) = session.pending_room_queries.pop_front() {
             let _ = response.send(Ok(rooms));
             return true;
@@ -1470,11 +1477,13 @@ fn resolve_query_notice(
     }
     if let Some((room, parsed_users)) = parse_who_notice(body) {
         let users = structured_users.unwrap_or(parsed_users);
+        session.hub.room_users.insert(room.clone(), users.clone());
         let _ = events.send(Event::UserList {
             hub,
             room: room.clone(),
             users: users.clone(),
         });
+        let _ = events.send(Event::HubChanged(session.hub.clone()));
         let Some(queries) = session.pending_user_queries.get_mut(&room) else {
             return false;
         };

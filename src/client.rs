@@ -85,9 +85,24 @@ pub struct Resource {
 pub enum Event {
     HubChanged(Hub),
     Message(Message),
-    Envelope { hub: [u8; 16], envelope: Envelope },
+    RoomList {
+        hub: [u8; 16],
+        rooms: Vec<RoomInfo>,
+    },
+    UserList {
+        hub: [u8; 16],
+        room: String,
+        users: Vec<UserInfo>,
+    },
+    Envelope {
+        hub: [u8; 16],
+        envelope: Envelope,
+    },
     Resource(Resource),
-    InvalidEnvelope { hub: [u8; 16], error: String },
+    InvalidEnvelope {
+        hub: [u8; 16],
+        error: String,
+    },
 }
 
 #[derive(Clone)]
@@ -1184,8 +1199,8 @@ async fn handle_inbound(
                 && let Ok(body) = String::from_utf8(resource.data.clone())
                 && let Some(kind) = resource_message_kind(&resource.descriptor.kind)
             {
-                let consumed =
-                    kind == MessageKind::Notice && resolve_query_notice(session, &body, None);
+                let consumed = kind == MessageKind::Notice
+                    && resolve_query_notice(session, &channels.events, inbound.hub, &body, None);
                 if !consumed {
                     let _ = channels.events.send(Event::Message(Message {
                         hub: resource.hub,
@@ -1203,7 +1218,7 @@ async fn handle_inbound(
         Some(T_NOTICE) => {
             let body = envelope.body_text().unwrap_or_default().to_string();
             let users = envelope.user_list();
-            if !resolve_query_notice(session, &body, users) {
+            if !resolve_query_notice(session, &channels.events, inbound.hub, &body, users) {
                 let _ = channels.events.send(Event::Message(Message {
                     hub: inbound.hub,
                     room: envelope.room().map(str::to_string),
@@ -1241,17 +1256,29 @@ async fn handle_inbound(
 
 fn resolve_query_notice(
     session: &mut Session,
+    events: &broadcast::Sender<Event>,
+    hub: [u8; 16],
     body: &str,
     structured_users: Option<Vec<UserInfo>>,
 ) -> bool {
-    if let Some(rooms) = parse_room_list_notice(body)
-        && let Some((_, response)) = session.pending_room_queries.pop_front()
-    {
-        let _ = response.send(Ok(rooms));
-        return true;
+    if let Some(rooms) = parse_room_list_notice(body) {
+        let _ = events.send(Event::RoomList {
+            hub,
+            rooms: rooms.clone(),
+        });
+        if let Some((_, response)) = session.pending_room_queries.pop_front() {
+            let _ = response.send(Ok(rooms));
+            return true;
+        }
+        return false;
     }
     if let Some((room, parsed_users)) = parse_who_notice(body) {
         let users = structured_users.unwrap_or(parsed_users);
+        let _ = events.send(Event::UserList {
+            hub,
+            room: room.clone(),
+            users: users.clone(),
+        });
         let Some(queries) = session.pending_user_queries.get_mut(&room) else {
             return false;
         };

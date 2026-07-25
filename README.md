@@ -29,6 +29,11 @@ println!("{} rooms, {} users", rooms.len(), users.len());
 # }
 ```
 
+Every successfully parsed LIST or WHO reply is also published as
+`Event::RoomList` or `Event::UserList`. This is useful for long-running bots
+that need to react to directory refreshes while another component owns the
+request.
+
 UTF-8 resources with an RRC text kind are emitted both as `Event::Resource`
 and as a normal `Event::Message`. Binary and application-specific resources
 remain available through `Event::Resource`.

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rns_identity::identity::Identity;
 use rns_runtime::link_client::{LinkSession, LinkSessionHandle};
@@ -132,6 +132,11 @@ enum Command {
         query_id: u64,
         response: oneshot::Sender<Result<Vec<UserInfo>, Error>>,
     },
+    Ping {
+        destination: [u8; 16],
+        query_id: u64,
+        response: oneshot::Sender<Result<Duration, Error>>,
+    },
     CancelQuery {
         query_id: u64,
     },
@@ -154,6 +159,7 @@ struct Session {
     reconnect_attempt: u32,
     pending_room_queries: VecDeque<PendingQuery<RoomInfo>>,
     pending_user_queries: BTreeMap<String, VecDeque<PendingQuery<UserInfo>>>,
+    pending_pings: BTreeMap<u64, (Instant, oneshot::Sender<Result<Duration, Error>>)>,
 }
 
 struct Inbound {
@@ -368,6 +374,27 @@ impl RrcClient {
             .send(Command::ListUsers {
                 destination,
                 room,
+                query_id,
+                response,
+            })
+            .await
+            .map_err(|_| Error::Stopped)?;
+        match tokio::time::timeout(timeout, receiver).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(Error::Stopped),
+            Err(_) => {
+                let _ = self.commands.send(Command::CancelQuery { query_id }).await;
+                Err(Error::Timeout)
+            }
+        }
+    }
+
+    pub async fn ping(&self, destination: [u8; 16], timeout: Duration) -> Result<Duration, Error> {
+        let query_id = self.next_query_id();
+        let (response, receiver) = oneshot::channel();
+        self.commands
+            .send(Command::Ping {
+                destination,
                 query_id,
                 response,
             })
@@ -731,6 +758,29 @@ async fn handle_command(
                 let _ = response.send(Err(error));
             }
         }
+        Command::Ping {
+            destination,
+            query_id,
+            response,
+        } => {
+            let result = match sessions.get_mut(&destination) {
+                Some(session) => {
+                    match send(&session.handle, Envelope::ping(&source, query_id)).await {
+                        Ok(()) => {
+                            session
+                                .pending_pings
+                                .insert(query_id, (Instant::now(), response));
+                            None
+                        }
+                        Err(error) => Some((response, error)),
+                    }
+                }
+                None => Some((response, Error::NotConnected)),
+            };
+            if let Some((response, error)) = result {
+                let _ = response.send(Err(error));
+            }
+        }
         Command::CancelQuery { query_id } => {
             for session in sessions.values_mut() {
                 session
@@ -740,6 +790,7 @@ async fn handle_command(
                     queries.retain(|(id, _)| *id != query_id);
                     !queries.is_empty()
                 });
+                session.pending_pings.remove(&query_id);
             }
         }
         Command::Reconnect {
@@ -924,6 +975,7 @@ async fn connect(
         reconnect_attempt: 0,
         pending_room_queries: VecDeque::new(),
         pending_user_queries: BTreeMap::new(),
+        pending_pings: BTreeMap::new(),
     })
 }
 
@@ -1020,6 +1072,13 @@ async fn handle_inbound(
         Some(T_PING) => {
             let _ = send(&session.handle, Envelope::pong(&source, &envelope)).await;
         }
+        Some(T_PONG) => {
+            if let Some(query_id) = envelope.integer(K_BODY)
+                && let Some((started, response)) = session.pending_pings.remove(&query_id)
+            {
+                let _ = response.send(Ok(started.elapsed()));
+            }
+        }
         Some(T_RESOURCE_ENVELOPE) => {
             let Some(descriptor) = envelope.resource_descriptor() else {
                 emit_invalid(
@@ -1067,7 +1126,8 @@ async fn handle_inbound(
                 && let Ok(body) = String::from_utf8(resource.data.clone())
                 && let Some(kind) = resource_message_kind(&resource.descriptor.kind)
             {
-                let consumed = kind == MessageKind::Notice && resolve_query_notice(session, &body);
+                let consumed =
+                    kind == MessageKind::Notice && resolve_query_notice(session, &body, None);
                 if !consumed {
                     let _ = channels.events.send(Event::Message(Message {
                         hub: resource.hub,
@@ -1084,7 +1144,8 @@ async fn handle_inbound(
         }
         Some(T_NOTICE) => {
             let body = envelope.body_text().unwrap_or_default().to_string();
-            if !resolve_query_notice(session, &body) {
+            let users = envelope.user_list();
+            if !resolve_query_notice(session, &body, users) {
                 let _ = channels.events.send(Event::Message(Message {
                     hub: inbound.hub,
                     room: envelope.room().map(str::to_string),
@@ -1120,14 +1181,19 @@ async fn handle_inbound(
     });
 }
 
-fn resolve_query_notice(session: &mut Session, body: &str) -> bool {
+fn resolve_query_notice(
+    session: &mut Session,
+    body: &str,
+    structured_users: Option<Vec<UserInfo>>,
+) -> bool {
     if let Some(rooms) = parse_room_list_notice(body)
         && let Some((_, response)) = session.pending_room_queries.pop_front()
     {
         let _ = response.send(Ok(rooms));
         return true;
     }
-    if let Some((room, users)) = parse_who_notice(body) {
+    if let Some((room, parsed_users)) = parse_who_notice(body) {
+        let users = structured_users.unwrap_or(parsed_users);
         let Some(queries) = session.pending_user_queries.get_mut(&room) else {
             return false;
         };

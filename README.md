@@ -6,6 +6,10 @@ interactive clients, services, and bots.
 The client supports multiple hubs, room join/part, messages, actions, commands,
 automatic PING/PONG handling, connection-state events, verified Reticulum
 Resources for large notices, and access to every received protocol envelope.
+An application-level heartbeat detects a vanished hub without waiting for the
+much longer Reticulum Link stale timeout. Lost HELLO packets are retried, and a
+missing WELCOME causes a bounded reconnect instead of an indefinite
+`Waiting for WELCOME` state.
 Each connected `Hub` exposes the parsed WELCOME version, capabilities and
 limits advertised by the server. Its `room_states` map tracks structured room
 registration, modes, and topics when the hub advertises the optional rsRRC
@@ -121,6 +125,8 @@ cargo run --example live_smoke -- <hub-destination-hash> <rsReticulum-config-dir
 
 The smoke client connects, waits for WELCOME, joins a room, sends a Resource
 backed message larger than one packet, waits for the echo, and disconnects.
+The adjacent rsRRCD `tests/live_e2e.sh` additionally runs the
+`live_reconnect` example through repeated daemon restarts.
 
 ## Bot example
 

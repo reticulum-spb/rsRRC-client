@@ -15,6 +15,10 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 const CHANNEL_CAPACITY: usize = 256;
 const TIMEOUT: Duration = Duration::from_secs(30);
 const RESOURCE_TEXT_THRESHOLD: usize = 300;
+const WELCOME_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+const WELCOME_RETRY_LIMIT: u8 = 3;
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -197,6 +201,16 @@ enum Command {
         destination: [u8; 16],
         session_id: u64,
     },
+    RetryHello {
+        destination: [u8; 16],
+        session_id: u64,
+        attempt: u8,
+    },
+    Heartbeat {
+        destination: [u8; 16],
+        session_id: u64,
+        expected_nonce: Option<u64>,
+    },
     Shutdown,
 }
 
@@ -213,6 +227,7 @@ struct Session {
     pending_room_queries: VecDeque<PendingQuery<RoomInfo>>,
     pending_user_queries: BTreeMap<String, VecDeque<PendingQuery<UserInfo>>>,
     pending_pings: BTreeMap<u64, (Instant, oneshot::Sender<Result<Duration, Error>>)>,
+    heartbeat_nonce: Option<u64>,
     restore_rooms_on_welcome: bool,
 }
 
@@ -912,6 +927,7 @@ async fn handle_command(
                     }
                     let hub = sessions[&destination].hub.clone();
                     let _ = channels.events.send(Event::HubChanged(hub.clone()));
+                    schedule_hello_retry(channels.commands.clone(), destination, session_id, 1);
                     let _ = response.send(Ok(hub));
                 }
                 Err(error) => {
@@ -1129,6 +1145,36 @@ async fn handle_command(
             )
             .await;
         }
+        Command::RetryHello {
+            destination,
+            session_id,
+            attempt,
+        } => {
+            retry_hello(
+                identity,
+                channels,
+                sessions,
+                destination,
+                session_id,
+                attempt,
+            )
+            .await;
+        }
+        Command::Heartbeat {
+            destination,
+            session_id,
+            expected_nonce,
+        } => {
+            heartbeat(
+                identity,
+                channels,
+                sessions,
+                destination,
+                session_id,
+                expected_nonce,
+            )
+            .await;
+        }
         Command::Shutdown => return true,
     }
     false
@@ -1172,6 +1218,7 @@ async fn reconnect(
             let _ = channels
                 .events
                 .send(Event::HubChanged(sessions[&destination].hub.clone()));
+            schedule_hello_retry(channels.commands.clone(), destination, session_id, 1);
         }
         Err(error) => {
             let Some(current) = sessions.get_mut(&destination) else {
@@ -1191,6 +1238,166 @@ async fn reconnect(
             );
         }
     }
+}
+
+async fn retry_hello(
+    identity: &Identity,
+    channels: &ActorChannels,
+    sessions: &mut BTreeMap<[u8; 16], Session>,
+    destination: [u8; 16],
+    session_id: u64,
+    attempt: u8,
+) {
+    let Some(session) = sessions.get_mut(&destination) else {
+        return;
+    };
+    if session.id != session_id || !session.hub.connected || session.hub.welcome.is_some() {
+        return;
+    }
+    if attempt <= WELCOME_RETRY_LIMIT {
+        let hello = Envelope::hello(&identity.hash, session.nick.as_deref());
+        match send(&session.handle, hello).await {
+            Ok(()) => {
+                session.hub.detail = format!("Waiting for WELCOME ({attempt})");
+                let _ = channels.events.send(Event::HubChanged(session.hub.clone()));
+                schedule_hello_retry(
+                    channels.commands.clone(),
+                    destination,
+                    session_id,
+                    attempt + 1,
+                );
+            }
+            Err(error) => {
+                session.hub.connected = false;
+                session.hub.detail = format!("HELLO retry failed: {error}");
+                session.reconnect_attempt = session.reconnect_attempt.saturating_add(1);
+                let _ = channels.events.send(Event::HubChanged(session.hub.clone()));
+                schedule_reconnect(
+                    channels.commands.clone(),
+                    destination,
+                    session.id,
+                    session.reconnect_attempt,
+                );
+            }
+        }
+        return;
+    }
+
+    session.hub.connected = false;
+    session.hub.detail = "WELCOME timeout; reconnecting".into();
+    session.reconnect_attempt = session.reconnect_attempt.saturating_add(1);
+    let _ = channels.events.send(Event::HubChanged(session.hub.clone()));
+    let _ = session.handle.close().await;
+    schedule_reconnect(
+        channels.commands.clone(),
+        destination,
+        session.id,
+        session.reconnect_attempt,
+    );
+}
+
+fn schedule_hello_retry(
+    commands: mpsc::Sender<Command>,
+    destination: [u8; 16],
+    session_id: u64,
+    attempt: u8,
+) {
+    tokio::spawn(async move {
+        tokio::time::sleep(WELCOME_RETRY_INTERVAL).await;
+        let _ = commands
+            .send(Command::RetryHello {
+                destination,
+                session_id,
+                attempt,
+            })
+            .await;
+    });
+}
+
+async fn heartbeat(
+    identity: &Identity,
+    channels: &ActorChannels,
+    sessions: &mut BTreeMap<[u8; 16], Session>,
+    destination: [u8; 16],
+    session_id: u64,
+    expected_nonce: Option<u64>,
+) {
+    let Some(session) = sessions.get_mut(&destination) else {
+        return;
+    };
+    if session.id != session_id || !session.hub.connected || session.hub.welcome.is_none() {
+        return;
+    }
+    if let Some(expected_nonce) = expected_nonce {
+        if session.heartbeat_nonce != Some(expected_nonce) {
+            schedule_heartbeat(
+                channels.commands.clone(),
+                destination,
+                session_id,
+                None,
+                HEARTBEAT_INTERVAL,
+            );
+            return;
+        }
+        session.hub.connected = false;
+        session.hub.detail = "RRC heartbeat timed out; reconnecting".into();
+        session.heartbeat_nonce = None;
+        session.reconnect_attempt = session.reconnect_attempt.saturating_add(1);
+        let _ = channels.events.send(Event::HubChanged(session.hub.clone()));
+        let _ = session.handle.close().await;
+        schedule_reconnect(
+            channels.commands.clone(),
+            destination,
+            session.id,
+            session.reconnect_attempt,
+        );
+        return;
+    }
+
+    let nonce = u64::MAX.saturating_sub(session_id);
+    match send(&session.handle, Envelope::ping(&identity.hash, nonce)).await {
+        Ok(()) => {
+            session.heartbeat_nonce = Some(nonce);
+            schedule_heartbeat(
+                channels.commands.clone(),
+                destination,
+                session_id,
+                Some(nonce),
+                HEARTBEAT_TIMEOUT,
+            );
+        }
+        Err(error) => {
+            session.hub.connected = false;
+            session.hub.detail = format!("RRC heartbeat failed: {error}");
+            session.reconnect_attempt = session.reconnect_attempt.saturating_add(1);
+            let _ = channels.events.send(Event::HubChanged(session.hub.clone()));
+            schedule_reconnect(
+                channels.commands.clone(),
+                destination,
+                session.id,
+                session.reconnect_attempt,
+            );
+        }
+    }
+}
+
+fn schedule_heartbeat(
+    commands: mpsc::Sender<Command>,
+    destination: [u8; 16],
+    session_id: u64,
+    expected_nonce: Option<u64>,
+    delay: Duration,
+) {
+    tokio::spawn(async move {
+        tokio::time::sleep(delay).await;
+        let _ = commands
+            .send(Command::Heartbeat {
+                destination,
+                session_id,
+                expected_nonce,
+            })
+            .await;
+    });
 }
 
 fn schedule_reconnect(
@@ -1292,6 +1499,7 @@ async fn connect(
         pending_room_queries: VecDeque::new(),
         pending_user_queries: BTreeMap::new(),
         pending_pings: BTreeMap::new(),
+        heartbeat_nonce: None,
         restore_rooms_on_welcome: false,
     })
 }
@@ -1364,6 +1572,7 @@ async fn handle_inbound(
     match envelope.message_type() {
         Some(T_WELCOME) => {
             session.reconnect_attempt = 0;
+            let first_welcome = session.hub.welcome.is_none();
             session.hub.welcome = envelope.welcome();
             session.hub.name = session
                 .hub
@@ -1371,6 +1580,15 @@ async fn handle_inbound(
                 .as_ref()
                 .and_then(|welcome| welcome.hub_name.clone());
             session.hub.detail = "Connected".into();
+            if first_welcome {
+                schedule_heartbeat(
+                    channels.commands.clone(),
+                    inbound.hub,
+                    session.id,
+                    None,
+                    HEARTBEAT_INTERVAL,
+                );
+            }
             if session.restore_rooms_on_welcome {
                 session.restore_rooms_on_welcome = false;
                 for (room, key) in session.desired_rooms.clone() {
@@ -1409,10 +1627,12 @@ async fn handle_inbound(
             let _ = send(&session.handle, Envelope::pong(&source, &envelope)).await;
         }
         Some(T_PONG) => {
-            if let Some(query_id) = envelope.integer(K_BODY)
-                && let Some((started, response)) = session.pending_pings.remove(&query_id)
-            {
-                let _ = response.send(Ok(started.elapsed()));
+            if let Some(query_id) = envelope.integer(K_BODY) {
+                if session.heartbeat_nonce == Some(query_id) {
+                    session.heartbeat_nonce = None;
+                } else if let Some((started, response)) = session.pending_pings.remove(&query_id) {
+                    let _ = response.send(Ok(started.elapsed()));
+                }
             }
         }
         Some(T_RESOURCE_ENVELOPE) => {

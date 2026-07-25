@@ -34,6 +34,10 @@ pub enum Error {
     InvalidResource,
     #[error("RRC hub does not support resource envelopes")]
     ResourcesUnsupported,
+    #[error("RRC hub does not support actions")]
+    ActionsUnsupported,
+    #[error("RRC hub does not support direct notices")]
+    DirectNoticesUnsupported,
     #[error("timed out waiting for an RRC event")]
     Timeout,
     #[error("RRC event receiver lagged by {0} events")]
@@ -90,6 +94,7 @@ pub struct Message {
     pub hub: [u8; 16],
     pub room: Option<String>,
     pub source: Option<[u8; 16]>,
+    pub destination: Option<[u8; 16]>,
     pub nick: Option<String>,
     pub body: String,
     pub timestamp_ms: u64,
@@ -506,6 +511,33 @@ impl RrcClient {
         self.send_text(destination, room, body, true).await
     }
 
+    pub async fn send_direct_notice(
+        &self,
+        destination: [u8; 16],
+        target: [u8; 16],
+        body: &str,
+    ) -> Result<(), Error> {
+        let hub = self
+            .hub(destination)
+            .await?
+            .filter(|hub| hub.connected)
+            .ok_or(Error::NotConnected)?;
+        let welcome = hub.welcome.as_ref();
+        if !welcome.is_some_and(|value| value.capabilities.direct_notice) {
+            return Err(Error::DirectNoticesUnsupported);
+        }
+        if body.len()
+            > welcome
+                .and_then(|value| value.limits.max_message_bytes)
+                .unwrap_or(16_384)
+        {
+            return Err(Error::InvalidMessage);
+        }
+        let envelope =
+            Envelope::direct_notice(&self.source, &target, body).ok_or(Error::InvalidMessage)?;
+        self.send_envelope(destination, envelope).await
+    }
+
     pub async fn send_command(
         &self,
         destination: [u8; 16],
@@ -767,6 +799,9 @@ impl RrcClient {
             .filter(|hub| hub.connected)
             .ok_or(Error::NotConnected)?;
         let welcome = hub.welcome.as_ref();
+        if action && !welcome.is_some_and(|value| value.capabilities.action) {
+            return Err(Error::ActionsUnsupported);
+        }
         let supports_resources = welcome.is_some_and(|value| value.capabilities.resource_envelope);
         let packet_limit = welcome
             .and_then(|value| value.limits.max_message_bytes)
@@ -1431,6 +1466,7 @@ async fn handle_inbound(
                         hub: resource.hub,
                         room: resource.room.clone(),
                         source: resource.source,
+                        destination: None,
                         nick: resource.nick.clone(),
                         body,
                         timestamp_ms: resource.timestamp_ms,
@@ -1448,6 +1484,9 @@ async fn handle_inbound(
                     hub: inbound.hub,
                     room: envelope.room().map(str::to_string),
                     source: envelope.source(),
+                    destination: envelope
+                        .bytes(K_DST)
+                        .and_then(|value| <[u8; 16]>::try_from(value).ok()),
                     nick: envelope.nick().map(str::to_string),
                     body,
                     timestamp_ms: envelope.timestamp_ms().unwrap_or_default(),
@@ -1465,6 +1504,9 @@ async fn handle_inbound(
                 hub: inbound.hub,
                 room: envelope.room().map(str::to_string),
                 source: envelope.source(),
+                destination: envelope
+                    .bytes(K_DST)
+                    .and_then(|value| <[u8; 16]>::try_from(value).ok()),
                 nick: envelope.nick().map(str::to_string),
                 body: envelope.body_text().unwrap_or_default().to_string(),
                 timestamp_ms: envelope.timestamp_ms().unwrap_or_default(),
@@ -1589,6 +1631,7 @@ mod tests {
             hub: [7; 16],
             room: Some("bots".into()),
             source: Some([8; 16]),
+            destination: None,
             nick: Some("helper".into()),
             body: "hello".into(),
             timestamp_ms: 1,

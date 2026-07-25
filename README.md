@@ -40,6 +40,11 @@ and keys, operator and voice roles, kicks, invites, and bans. These helpers
 validate command arguments before sending them; `send_command` remains
 available for server-specific extensions.
 
+Actions and identity-addressed direct notices are available through
+`send_action` and `send_direct_notice`. Both reject the operation locally when
+the hub did not advertise the corresponding capability. Incoming direct
+notices retain their target in `Message::destination`.
+
 UTF-8 resources with an RRC text kind are emitted both as `Event::Resource`
 and as a normal `Event::Message`. Binary and application-specific resources
 remain available through `Event::Resource`.

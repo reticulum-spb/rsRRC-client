@@ -32,6 +32,8 @@ pub enum Error {
     InvalidMessage,
     #[error("invalid RRC resource")]
     InvalidResource,
+    #[error("RRC hub does not support resource envelopes")]
+    ResourcesUnsupported,
     #[error("timed out waiting for an RRC event")]
     Timeout,
     #[error("RRC event receiver lagged by {0} events")]
@@ -718,6 +720,18 @@ impl RrcClient {
         data: Vec<u8>,
         encoding: Option<&str>,
     ) -> Result<(), Error> {
+        let hub = self
+            .hub(destination)
+            .await?
+            .filter(|hub| hub.connected)
+            .ok_or(Error::NotConnected)?;
+        if !hub
+            .welcome
+            .as_ref()
+            .is_some_and(|welcome| welcome.capabilities.resource_envelope)
+        {
+            return Err(Error::ResourcesUnsupported);
+        }
         let envelope = Envelope::resource(&self.source, room, kind, &data, encoding)
             .ok_or(Error::InvalidResource)?;
         let (response, receiver) = oneshot::channel();
@@ -747,7 +761,17 @@ impl RrcClient {
         body: &str,
         action: bool,
     ) -> Result<(), Error> {
-        if body.len() > RESOURCE_TEXT_THRESHOLD {
+        let hub = self
+            .hub(destination)
+            .await?
+            .filter(|hub| hub.connected)
+            .ok_or(Error::NotConnected)?;
+        let welcome = hub.welcome.as_ref();
+        let supports_resources = welcome.is_some_and(|value| value.capabilities.resource_envelope);
+        let packet_limit = welcome
+            .and_then(|value| value.limits.max_message_bytes)
+            .unwrap_or(16_384);
+        if use_resource_for_text(body.len(), supports_resources, packet_limit)? {
             return self
                 .send_resource(
                     destination,
@@ -1542,6 +1566,20 @@ fn command_text(text: &str) -> Result<&str, Error> {
     }
 }
 
+fn use_resource_for_text(
+    body_bytes: usize,
+    supports_resources: bool,
+    packet_limit: usize,
+) -> Result<bool, Error> {
+    if supports_resources && (body_bytes > RESOURCE_TEXT_THRESHOLD || body_bytes > packet_limit) {
+        Ok(true)
+    } else if body_bytes > packet_limit {
+        Err(Error::ResourcesUnsupported)
+    } else {
+        Ok(false)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1601,6 +1639,18 @@ mod tests {
         assert!(matches!(
             command_text("topic\n/kick rust bob"),
             Err(Error::InvalidMessage)
+        ));
+    }
+
+    #[test]
+    fn text_transport_respects_welcome_capabilities_and_limits() {
+        assert!(!use_resource_for_text(300, true, 350).unwrap());
+        assert!(use_resource_for_text(301, true, 350).unwrap());
+        assert!(use_resource_for_text(201, true, 200).unwrap());
+        assert!(!use_resource_for_text(300, false, 350).unwrap());
+        assert!(matches!(
+            use_resource_for_text(351, false, 350),
+            Err(Error::ResourcesUnsupported)
         ));
     }
 }

@@ -44,8 +44,11 @@ UTF-8 resources with an RRC text kind are emitted both as `Event::Resource`
 and as a normal `Event::Message`. Binary and application-specific resources
 remain available through `Event::Resource`.
 
-Long messages and actions are automatically sent as an RRC Resource. Bots can
-also send arbitrary resources explicitly:
+Long messages and actions are automatically sent as an RRC Resource. The
+selection respects the capabilities and packet limit advertised in WELCOME;
+attempting Resource delivery to an unsupported hub returns
+`Error::ResourcesUnsupported`. Bots can also send arbitrary resources
+explicitly:
 
 ```rust,no_run
 # async fn send(

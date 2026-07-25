@@ -42,6 +42,7 @@ pub enum Error {
 pub struct Hub {
     pub destination_hash: [u8; 16],
     pub name: Option<String>,
+    pub nick: Option<String>,
     pub welcome: Option<Welcome>,
     pub connected: bool,
     pub rooms: Vec<String>,
@@ -117,6 +118,11 @@ enum Command {
     Disconnect {
         destination: [u8; 16],
         response: oneshot::Sender<Result<(), Error>>,
+    },
+    SetNick {
+        destination: [u8; 16],
+        nick: String,
+        response: oneshot::Sender<Result<Hub, Error>>,
     },
     Hubs {
         response: oneshot::Sender<Vec<Hub>>,
@@ -216,6 +222,20 @@ impl RrcClient {
         self.commands
             .send(Command::Disconnect {
                 destination,
+                response,
+            })
+            .await
+            .map_err(|_| Error::Stopped)?;
+        receiver.await.map_err(|_| Error::Stopped)?
+    }
+
+    pub async fn set_nick(&self, destination: [u8; 16], nick: &str) -> Result<Hub, Error> {
+        let nick = normalize_nick(nick, 32).ok_or(Error::InvalidMessage)?;
+        let (response, receiver) = oneshot::channel();
+        self.commands
+            .send(Command::SetNick {
+                destination,
+                nick,
                 response,
             })
             .await
@@ -637,6 +657,11 @@ async fn handle_command(
             let room_key = envelope.body_text().map(str::to_string);
             let result = match sessions.get_mut(&destination) {
                 Some(session) => {
+                    if matches!(message_type, Some(T_JOIN | T_MSG | T_NOTICE | T_ACTION))
+                        && let Some(nick) = &session.nick
+                    {
+                        envelope.set_nick(nick);
+                    }
                     let result = send(&session.handle, envelope).await;
                     if result.is_ok() {
                         match (message_type, room) {
@@ -698,6 +723,23 @@ async fn handle_command(
             };
             let _ = response.send(result);
         }
+        Command::SetNick {
+            destination,
+            nick,
+            response,
+        } => {
+            let result = match sessions.get_mut(&destination) {
+                Some(session) => {
+                    session.nick = Some(nick.clone());
+                    session.hub.nick = Some(nick);
+                    let hub = session.hub.clone();
+                    let _ = channels.events.send(Event::HubChanged(hub.clone()));
+                    Ok(hub)
+                }
+                None => Err(Error::NotConnected),
+            };
+            let _ = response.send(result);
+        }
         Command::Hubs { response } => {
             let _ = response.send(
                 sessions
@@ -713,8 +755,11 @@ async fn handle_command(
         } => {
             let result = match sessions.get_mut(&destination) {
                 Some(session) => {
-                    let envelope =
+                    let mut envelope =
                         Envelope::command(&source, None, "/list").expect("valid LIST command");
+                    if let Some(nick) = &session.nick {
+                        envelope.set_nick(nick);
+                    }
                     match send(&session.handle, envelope).await {
                         Ok(()) => {
                             session.pending_room_queries.push_back((query_id, response));
@@ -738,8 +783,11 @@ async fn handle_command(
             let result = match sessions.get_mut(&destination) {
                 Some(session) => {
                     let command = format!("/who {room}");
-                    let envelope = Envelope::command(&source, Some(&room), &command)
+                    let mut envelope = Envelope::command(&source, Some(&room), &command)
                         .expect("validated WHO command");
+                    if let Some(nick) = &session.nick {
+                        envelope.set_nick(nick);
+                    }
                     match send(&session.handle, envelope).await {
                         Ok(()) => {
                             session
@@ -964,6 +1012,7 @@ async fn connect(
         hub: Hub {
             destination_hash: destination,
             name: None,
+            nick: nick.map(str::to_string),
             welcome: None,
             connected: true,
             rooms: Vec::new(),

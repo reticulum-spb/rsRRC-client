@@ -121,3 +121,15 @@ cargo run --example live_smoke -- <hub-destination-hash> <rsReticulum-config-dir
 
 The smoke client connects, waits for WELCOME, joins a room, sends a Resource
 backed message larger than one packet, waits for the echo, and disconnects.
+
+## Bot example
+
+A small event-driven bot demonstrates connection readiness, room restoration,
+message filtering, WHO, and replies:
+
+```text
+cargo run --example bot -- <hub-destination-hash> <rsReticulum-config-dir> <room>
+```
+
+It responds to `!ping` and `!who`. Production bots should load a persistent
+identity instead of the fresh identity used by this compact example.

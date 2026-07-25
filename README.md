@@ -34,6 +34,11 @@ Every successfully parsed LIST or WHO reply is also published as
 that need to react to directory refreshes while another component owns the
 request.
 
+Room administration has typed helpers for registration, topics, room modes
+and keys, operator and voice roles, kicks, invites, and bans. These helpers
+validate command arguments before sending them; `send_command` remains
+available for server-specific extensions.
+
 UTF-8 resources with an RRC text kind are emitted both as `Event::Resource`
 and as a normal `Event::Message`. Binary and application-specific resources
 remain available through `Event::Resource`.

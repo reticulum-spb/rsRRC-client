@@ -26,6 +26,8 @@ pub enum Error {
     UnknownIdentity,
     #[error("invalid room name")]
     InvalidRoom,
+    #[error("invalid RRC command target")]
+    InvalidTarget,
     #[error("invalid RRC message")]
     InvalidMessage,
     #[error("invalid RRC resource")]
@@ -56,6 +58,27 @@ pub enum MessageKind {
     Notice,
     Action,
     Error,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RoomMode {
+    Moderated,
+    InviteOnly,
+    TopicOperatorsOnly,
+    NoOutsideMessages,
+    Private,
+}
+
+impl RoomMode {
+    fn flag(self) -> char {
+        match self {
+            Self::Moderated => 'm',
+            Self::InviteOnly => 'i',
+            Self::TopicOperatorsOnly => 't',
+            Self::NoOutsideMessages => 'n',
+            Self::Private => 'p',
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -493,6 +516,179 @@ impl RrcClient {
         let envelope =
             Envelope::command(&self.source, room, &command).ok_or(Error::InvalidMessage)?;
         self.send_envelope(destination, envelope).await
+    }
+
+    pub async fn register_room(
+        &self,
+        destination: [u8; 16],
+        room: &str,
+        registered: bool,
+    ) -> Result<(), Error> {
+        let room = command_room(room)?;
+        let command = if registered {
+            format!("/register {room}")
+        } else {
+            format!("/unregister {room}")
+        };
+        self.send_command(destination, Some(&room), &command).await
+    }
+
+    pub async fn set_topic(
+        &self,
+        destination: [u8; 16],
+        room: &str,
+        topic: &str,
+    ) -> Result<(), Error> {
+        let room = command_room(room)?;
+        let topic = command_text(topic)?;
+        self.send_command(destination, Some(&room), &format!("/topic {room} {topic}"))
+            .await
+    }
+
+    pub async fn set_room_mode(
+        &self,
+        destination: [u8; 16],
+        room: &str,
+        mode: RoomMode,
+        enabled: bool,
+    ) -> Result<(), Error> {
+        let room = command_room(room)?;
+        let sign = if enabled { '+' } else { '-' };
+        self.send_command(
+            destination,
+            Some(&room),
+            &format!("/mode {room} {sign}{}", mode.flag()),
+        )
+        .await
+    }
+
+    pub async fn set_room_key(
+        &self,
+        destination: [u8; 16],
+        room: &str,
+        key: Option<&str>,
+    ) -> Result<(), Error> {
+        let room = command_room(room)?;
+        let command = match key {
+            Some(key) => format!("/mode {room} +k {}", command_text(key)?),
+            None => format!("/mode {room} -k"),
+        };
+        self.send_command(destination, Some(&room), &command).await
+    }
+
+    pub async fn set_operator(
+        &self,
+        destination: [u8; 16],
+        room: &str,
+        target: &str,
+        enabled: bool,
+    ) -> Result<(), Error> {
+        self.member_command(
+            destination,
+            room,
+            target,
+            if enabled { "op" } else { "deop" },
+        )
+        .await
+    }
+
+    pub async fn set_voice(
+        &self,
+        destination: [u8; 16],
+        room: &str,
+        target: &str,
+        enabled: bool,
+    ) -> Result<(), Error> {
+        self.member_command(
+            destination,
+            room,
+            target,
+            if enabled { "voice" } else { "devoice" },
+        )
+        .await
+    }
+
+    pub async fn kick(&self, destination: [u8; 16], room: &str, target: &str) -> Result<(), Error> {
+        self.member_command(destination, room, target, "kick").await
+    }
+
+    pub async fn invite(
+        &self,
+        destination: [u8; 16],
+        room: &str,
+        target: &str,
+    ) -> Result<(), Error> {
+        self.access_command(destination, room, "invite", "add", Some(target))
+            .await
+    }
+
+    pub async fn revoke_invite(
+        &self,
+        destination: [u8; 16],
+        room: &str,
+        target: &str,
+    ) -> Result<(), Error> {
+        self.access_command(destination, room, "invite", "del", Some(target))
+            .await
+    }
+
+    pub async fn ban(&self, destination: [u8; 16], room: &str, target: &str) -> Result<(), Error> {
+        self.access_command(destination, room, "ban", "add", Some(target))
+            .await
+    }
+
+    pub async fn unban(
+        &self,
+        destination: [u8; 16],
+        room: &str,
+        target: &str,
+    ) -> Result<(), Error> {
+        self.access_command(destination, room, "ban", "del", Some(target))
+            .await
+    }
+
+    pub async fn list_invites(&self, destination: [u8; 16], room: &str) -> Result<(), Error> {
+        self.access_command(destination, room, "invite", "list", None)
+            .await
+    }
+
+    pub async fn list_bans(&self, destination: [u8; 16], room: &str) -> Result<(), Error> {
+        self.access_command(destination, room, "ban", "list", None)
+            .await
+    }
+
+    async fn member_command(
+        &self,
+        destination: [u8; 16],
+        room: &str,
+        target: &str,
+        command: &str,
+    ) -> Result<(), Error> {
+        let room = command_room(room)?;
+        let target = command_target(target)?;
+        self.send_command(
+            destination,
+            Some(&room),
+            &format!("/{command} {room} {target}"),
+        )
+        .await
+    }
+
+    async fn access_command(
+        &self,
+        destination: [u8; 16],
+        room: &str,
+        command: &str,
+        operation: &str,
+        target: Option<&str>,
+    ) -> Result<(), Error> {
+        let room = command_room(room)?;
+        let target = target.map(command_target).transpose()?;
+        let command = match target {
+            Some(target) => format!("/{command} {room} {operation} {target}"),
+            None => format!("/{command} {room} {operation}"),
+        };
+        self.send_command(destination, Some(&room), &command).await
     }
 
     pub async fn send_envelope(
@@ -1311,6 +1507,32 @@ fn resource_message_kind(kind: &str) -> Option<MessageKind> {
     }
 }
 
+fn command_room(room: &str) -> Result<String, Error> {
+    normalize_room(room, 64).ok_or(Error::InvalidRoom)
+}
+
+fn command_target(target: &str) -> Result<&str, Error> {
+    let target = target.trim();
+    if target.is_empty()
+        || target.len() > 128
+        || target.chars().any(char::is_whitespace)
+        || target.contains('\0')
+    {
+        Err(Error::InvalidTarget)
+    } else {
+        Ok(target)
+    }
+}
+
+fn command_text(text: &str) -> Result<&str, Error> {
+    let text = text.trim();
+    if text.is_empty() || text.len() > 16_384 || text.contains(['\0', '\r', '\n']) {
+        Err(Error::InvalidMessage)
+    } else {
+        Ok(text)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1355,5 +1577,21 @@ mod tests {
         assert_eq!(reconnect_delay(1), Duration::from_secs(1));
         assert_eq!(reconnect_delay(4), Duration::from_secs(8));
         assert_eq!(reconnect_delay(100), Duration::from_secs(64));
+    }
+
+    #[test]
+    fn command_arguments_reject_injection_and_normalize_rooms() {
+        assert_eq!(command_room(" #Rust ").unwrap(), "rust");
+        assert!(matches!(command_room("bad room"), Err(Error::InvalidRoom)));
+        assert_eq!(command_target("alice").unwrap(), "alice");
+        assert!(matches!(
+            command_target("alice /kick rust bob"),
+            Err(Error::InvalidTarget)
+        ));
+        assert_eq!(command_text(" Room topic ").unwrap(), "Room topic");
+        assert!(matches!(
+            command_text("topic\n/kick rust bob"),
+            Err(Error::InvalidMessage)
+        ));
     }
 }

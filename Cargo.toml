@@ -1,0 +1,16 @@
+[package]
+name = "rs-rrc-client"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "Reusable asynchronous RRC client for rsReticulum"
+
+[dependencies]
+thiserror = "2"
+tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread", "time", "macros"] }
+rs-rrc = { path = "../rsRRC" }
+rns-identity = { path = "../rsReticulum/crates/rns-identity" }
+rns-runtime = { path = "../rsReticulum/crates/rns-runtime" }
+rns-transport = { path = "../rsReticulum/crates/rns-transport" }
+sha2 = "0.10"

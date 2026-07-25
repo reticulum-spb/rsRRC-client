@@ -166,6 +166,7 @@ struct Session {
     pending_room_queries: VecDeque<PendingQuery<RoomInfo>>,
     pending_user_queries: BTreeMap<String, VecDeque<PendingQuery<UserInfo>>>,
     pending_pings: BTreeMap<u64, (Instant, oneshot::Sender<Result<Duration, Error>>)>,
+    restore_rooms_on_welcome: bool,
 }
 
 struct Inbound {
@@ -891,16 +892,8 @@ async fn reconnect(
     {
         Ok(mut replacement) => {
             replacement.desired_rooms = desired_rooms.clone();
-            replacement.hub.detail = "Reconnected; restoring rooms".into();
-            for (room, key) in &desired_rooms {
-                let Some(envelope) = Envelope::join(&identity.hash, room, key.as_deref()) else {
-                    continue;
-                };
-                if let Err(error) = send(&replacement.handle, envelope).await {
-                    replacement.hub.detail = format!("Room restore failed: {error}");
-                    break;
-                }
-            }
+            replacement.restore_rooms_on_welcome = true;
+            replacement.hub.detail = "Reconnected; waiting for WELCOME".into();
             if let Some(previous) = sessions.insert(destination, replacement) {
                 let _ = previous.handle.close().await;
             }
@@ -1025,6 +1018,7 @@ async fn connect(
         pending_room_queries: VecDeque::new(),
         pending_user_queries: BTreeMap::new(),
         pending_pings: BTreeMap::new(),
+        restore_rooms_on_welcome: false,
     })
 }
 
@@ -1101,6 +1095,21 @@ async fn handle_inbound(
                 .as_ref()
                 .and_then(|welcome| welcome.hub_name.clone());
             session.hub.detail = "Connected".into();
+            if session.restore_rooms_on_welcome {
+                session.restore_rooms_on_welcome = false;
+                for (room, key) in session.desired_rooms.clone() {
+                    let Some(mut join) = Envelope::join(&source, &room, key.as_deref()) else {
+                        continue;
+                    };
+                    if let Some(nick) = &session.nick {
+                        join.set_nick(nick);
+                    }
+                    if let Err(error) = send(&session.handle, join).await {
+                        session.hub.detail = format!("Room restore failed: {error}");
+                        break;
+                    }
+                }
+            }
             let _ = channels.events.send(Event::HubChanged(session.hub.clone()));
         }
         Some(T_JOINED) => {

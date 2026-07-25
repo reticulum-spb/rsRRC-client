@@ -33,9 +33,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let client = RrcClient::new(runtime, Identity::new());
     let mut events = client.subscribe();
     client.connect(destination, Some("rs-rrc-smoke")).await?;
-    let hub = client
+    client
         .wait_until_connected(destination, Duration::from_secs(30))
         .await?;
+    let round_trip = client.ping(destination, Duration::from_secs(30)).await?;
+    let hub = client.set_nick(destination, "rs-rrc-smoke-renamed").await?;
+    if hub.nick.as_deref() != Some("rs-rrc-smoke-renamed") {
+        return Err("hub nickname was not updated".into());
+    }
     let rooms = client
         .list_rooms(destination, Duration::from_secs(30))
         .await?;
@@ -51,7 +56,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .await?;
     if !users
         .iter()
-        .any(|user| user.nick.as_deref() == Some("rs-rrc-smoke"))
+        .any(|user| user.nick.as_deref() == Some("rs-rrc-smoke-renamed"))
     {
         return Err("smoke user was not returned by WHO".into());
     }
@@ -75,8 +80,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     client.shutdown().await?;
     shutdown.trigger();
     println!(
-        "RRC CLIENT SMOKE OK: hub={} room={room}",
-        hub.name.unwrap_or_else(|| encode_hash(destination))
+        "RRC CLIENT SMOKE OK: hub={} room={room} ping={}ms",
+        hub.name.unwrap_or_else(|| encode_hash(destination)),
+        round_trip.as_millis(),
     );
     Ok(())
 }

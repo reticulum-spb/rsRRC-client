@@ -1389,10 +1389,11 @@ async fn handle_inbound(
             let _ = channels.events.send(Event::HubChanged(session.hub.clone()));
         }
         Some(T_JOINED) => {
-            if let Some(room) = envelope.room()
-                && !session.hub.rooms.iter().any(|value| value == room)
-            {
-                session.hub.rooms.push(room.to_string());
+            if let Some(room) = envelope.room() {
+                if !session.hub.rooms.iter().any(|value| value == room) {
+                    session.hub.rooms.push(room.to_string());
+                }
+                session.hub.room_users.remove(room);
             }
             let _ = channels.events.send(Event::HubChanged(session.hub.clone()));
         }
@@ -1481,6 +1482,12 @@ async fn handle_inbound(
         Some(T_NOTICE) => {
             let body = envelope.body_text().unwrap_or_default().to_string();
             let users = envelope.user_list();
+            if body.starts_with("nick changed:")
+                && let Some(room) = envelope.room()
+                && session.hub.room_users.remove(room).is_some()
+            {
+                let _ = channels.events.send(Event::HubChanged(session.hub.clone()));
+            }
             if !resolve_query_notice(session, &channels.events, inbound.hub, &body, users) {
                 let _ = channels.events.send(Event::Message(Message {
                     hub: inbound.hub,

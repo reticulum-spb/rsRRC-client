@@ -1349,11 +1349,13 @@ async fn handle_inbound(
         .room()
         .zip(envelope.room_state())
         .map(|(room, state)| {
+            let directory_changed =
+                apply_room_state_to_directory(&mut session.hub.public_rooms, room, &state);
             let previous = session
                 .hub
                 .room_states
                 .insert(room.to_string(), state.clone());
-            previous.as_ref() != Some(&state)
+            previous.as_ref() != Some(&state) || directory_changed
         })
         .unwrap_or(false);
     if room_state_changed && envelope.message_type() != Some(T_JOINED) {
@@ -1622,6 +1624,30 @@ fn use_resource_for_text(
     }
 }
 
+fn apply_room_state_to_directory(rooms: &mut Vec<RoomInfo>, room: &str, state: &RoomState) -> bool {
+    let existing = rooms.iter().position(|entry| entry.name == room);
+    if !state.registered {
+        if let Some(index) = existing {
+            rooms.remove(index);
+            return true;
+        }
+        return false;
+    }
+    if let Some(index) = existing {
+        if rooms[index].topic != state.topic {
+            rooms[index].topic = state.topic.clone();
+            return true;
+        }
+        return false;
+    }
+    rooms.push(RoomInfo {
+        name: room.to_string(),
+        topic: state.topic.clone(),
+    });
+    rooms.sort_by(|left, right| left.name.cmp(&right.name));
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1695,5 +1721,53 @@ mod tests {
             use_resource_for_text(351, false, 350),
             Err(Error::ResourcesUnsupported)
         ));
+    }
+
+    #[test]
+    fn structured_room_state_keeps_public_directory_current() {
+        let mut rooms = vec![RoomInfo {
+            name: "zeta".into(),
+            topic: None,
+        }];
+        let registered = RoomState {
+            registered: true,
+            modes: "+r".into(),
+            topic: Some("Rust".into()),
+        };
+        assert!(apply_room_state_to_directory(
+            &mut rooms,
+            "alpha",
+            &registered
+        ));
+        assert_eq!(
+            rooms,
+            vec![
+                RoomInfo {
+                    name: "alpha".into(),
+                    topic: Some("Rust".into()),
+                },
+                RoomInfo {
+                    name: "zeta".into(),
+                    topic: None,
+                },
+            ]
+        );
+        assert!(!apply_room_state_to_directory(
+            &mut rooms,
+            "alpha",
+            &registered
+        ));
+
+        let unregistered = RoomState {
+            registered: false,
+            modes: "(none)".into(),
+            topic: None,
+        };
+        assert!(apply_room_state_to_directory(
+            &mut rooms,
+            "alpha",
+            &unregistered
+        ));
+        assert_eq!(rooms.len(), 1);
     }
 }

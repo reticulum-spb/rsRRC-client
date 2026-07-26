@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -217,6 +216,19 @@ enum Command {
 type QuerySender<T> = oneshot::Sender<Result<Vec<T>, Error>>;
 type PendingQuery<T> = (u64, QuerySender<T>);
 
+fn resolve_queries<T: Clone>(queries: Vec<PendingQuery<T>>, value: Vec<T>) -> bool {
+    let handled = !queries.is_empty();
+    for (_, response) in queries {
+        let _ = response.send(Ok(value.clone()));
+    }
+    handled
+}
+
+struct PendingPing {
+    started: Instant,
+    waiters: Vec<(u64, oneshot::Sender<Result<Duration, Error>>)>,
+}
+
 struct Session {
     id: u64,
     handle: LinkSessionHandle,
@@ -224,9 +236,10 @@ struct Session {
     nick: Option<String>,
     desired_rooms: BTreeMap<String, Option<String>>,
     reconnect_attempt: u32,
-    pending_room_queries: VecDeque<PendingQuery<RoomInfo>>,
-    pending_user_queries: BTreeMap<String, VecDeque<PendingQuery<UserInfo>>>,
-    pending_pings: BTreeMap<u64, (Instant, oneshot::Sender<Result<Duration, Error>>)>,
+    room_query_in_flight: bool,
+    pending_room_queries: Vec<PendingQuery<RoomInfo>>,
+    pending_user_queries: BTreeMap<String, Vec<PendingQuery<UserInfo>>>,
+    pending_pings: BTreeMap<u64, PendingPing>,
     heartbeat_nonce: Option<u64>,
     restore_rooms_on_welcome: bool,
 }
@@ -1044,6 +1057,10 @@ async fn handle_command(
         } => {
             let result = match sessions.get_mut(&destination) {
                 Some(session) => {
+                    if session.room_query_in_flight {
+                        session.pending_room_queries.push((query_id, response));
+                        return false;
+                    }
                     let mut envelope =
                         Envelope::command(&source, None, "/list").expect("valid LIST command");
                     if let Some(nick) = &session.nick {
@@ -1051,7 +1068,8 @@ async fn handle_command(
                     }
                     match send(&session.handle, envelope).await {
                         Ok(()) => {
-                            session.pending_room_queries.push_back((query_id, response));
+                            session.room_query_in_flight = true;
+                            session.pending_room_queries.push((query_id, response));
                             None
                         }
                         Err(error) => Some((response, error)),
@@ -1071,6 +1089,10 @@ async fn handle_command(
         } => {
             let result = match sessions.get_mut(&destination) {
                 Some(session) => {
+                    if let Some(queries) = session.pending_user_queries.get_mut(&room) {
+                        queries.push((query_id, response));
+                        return false;
+                    }
                     let command = format!("/who {room}");
                     let mut envelope = Envelope::command(&source, Some(&room), &command)
                         .expect("validated WHO command");
@@ -1083,7 +1105,7 @@ async fn handle_command(
                                 .pending_user_queries
                                 .entry(room)
                                 .or_default()
-                                .push_back((query_id, response));
+                                .push((query_id, response));
                             None
                         }
                         Err(error) => Some((response, error)),
@@ -1102,11 +1124,19 @@ async fn handle_command(
         } => {
             let result = match sessions.get_mut(&destination) {
                 Some(session) => {
+                    if let Some(pending) = session.pending_pings.values_mut().next() {
+                        pending.waiters.push((query_id, response));
+                        return false;
+                    }
                     match send(&session.handle, Envelope::ping(&source, query_id)).await {
                         Ok(()) => {
-                            session
-                                .pending_pings
-                                .insert(query_id, (Instant::now(), response));
+                            session.pending_pings.insert(
+                                query_id,
+                                PendingPing {
+                                    started: Instant::now(),
+                                    waiters: vec![(query_id, response)],
+                                },
+                            );
                             None
                         }
                         Err(error) => Some((response, error)),
@@ -1123,11 +1153,13 @@ async fn handle_command(
                 session
                     .pending_room_queries
                     .retain(|(id, _)| *id != query_id);
-                session.pending_user_queries.retain(|_, queries| {
+                for queries in session.pending_user_queries.values_mut() {
                     queries.retain(|(id, _)| *id != query_id);
-                    !queries.is_empty()
+                }
+                session.pending_pings.retain(|_, pending| {
+                    pending.waiters.retain(|(id, _)| *id != query_id);
+                    !pending.waiters.is_empty()
                 });
-                session.pending_pings.remove(&query_id);
             }
         }
         Command::Reconnect {
@@ -1496,7 +1528,8 @@ async fn connect(
         nick: nick.map(str::to_string),
         desired_rooms: BTreeMap::new(),
         reconnect_attempt: 0,
-        pending_room_queries: VecDeque::new(),
+        room_query_in_flight: false,
+        pending_room_queries: Vec::new(),
         pending_user_queries: BTreeMap::new(),
         pending_pings: BTreeMap::new(),
         heartbeat_nonce: None,
@@ -1630,8 +1663,11 @@ async fn handle_inbound(
             if let Some(query_id) = envelope.integer(K_BODY) {
                 if session.heartbeat_nonce == Some(query_id) {
                     session.heartbeat_nonce = None;
-                } else if let Some((started, response)) = session.pending_pings.remove(&query_id) {
-                    let _ = response.send(Ok(started.elapsed()));
+                } else if let Some(pending) = session.pending_pings.remove(&query_id) {
+                    let elapsed = pending.started.elapsed();
+                    for (_, response) in pending.waiters {
+                        let _ = response.send(Ok(elapsed));
+                    }
                 }
             }
         }
@@ -1764,11 +1800,9 @@ fn resolve_query_notice(
             rooms: rooms.clone(),
         });
         let _ = events.send(Event::HubChanged(session.hub.clone()));
-        if let Some((_, response)) = session.pending_room_queries.pop_front() {
-            let _ = response.send(Ok(rooms));
-            return true;
-        }
-        return false;
+        session.room_query_in_flight = false;
+        let queries = std::mem::take(&mut session.pending_room_queries);
+        return resolve_queries(queries, rooms);
     }
     if let Some((room, parsed_users)) = parse_who_notice(body) {
         let users = structured_users.unwrap_or(parsed_users);
@@ -1779,17 +1813,14 @@ fn resolve_query_notice(
             users: users.clone(),
         });
         let _ = events.send(Event::HubChanged(session.hub.clone()));
-        let Some(queries) = session.pending_user_queries.get_mut(&room) else {
+        if !session.pending_user_queries.contains_key(&room) {
             return false;
-        };
-        let Some((_, response)) = queries.pop_front() else {
-            return false;
-        };
-        if queries.is_empty() {
-            session.pending_user_queries.remove(&room);
         }
-        let _ = response.send(Ok(users));
-        return true;
+        let queries = session
+            .pending_user_queries
+            .remove(&room)
+            .unwrap_or_default();
+        return resolve_queries(queries, users);
     }
     false
 }
@@ -1920,6 +1951,22 @@ mod tests {
         assert_eq!(reconnect_delay(1), Duration::from_secs(1));
         assert_eq!(reconnect_delay(4), Duration::from_secs(8));
         assert_eq!(reconnect_delay(100), Duration::from_secs(64));
+    }
+
+    #[tokio::test]
+    async fn coalesced_query_result_reaches_every_waiter() {
+        let (first_tx, first_rx) = oneshot::channel();
+        let (second_tx, second_rx) = oneshot::channel();
+        let queries = vec![(1, first_tx), (2, second_tx)];
+        assert!(resolve_queries(
+            queries,
+            vec![RoomInfo {
+                name: "rust".into(),
+                topic: Some("Rust".into()),
+            }],
+        ));
+        assert_eq!(first_rx.await.unwrap().unwrap()[0].name, "rust");
+        assert_eq!(second_rx.await.unwrap().unwrap()[0].name, "rust");
     }
 
     #[test]

@@ -46,7 +46,9 @@ request. The latest results are retained in `Hub::public_rooms` and
 room-state notices keep the cached public directory current after topic,
 registration, and unregistration changes. Membership and nickname-change
 events invalidate the affected user cache so callers never mistake stale WHO
-data for current state.
+data for current state. Concurrent LIST, per-room WHO, and per-hub PING calls
+are coalesced into one wire request; all active waiters receive the shared
+reply, while timed-out waiters are cancelled independently.
 
 Room administration has typed helpers for registration, topics, room modes
 and keys, operator and voice roles, kicks, invites, and bans. These helpers

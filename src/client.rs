@@ -1509,7 +1509,7 @@ async fn send(handle: &LinkSessionHandle, envelope: Envelope) -> Result<(), Erro
         .encode()
         .map_err(|error| Error::Transport(error.to_string()))?;
     handle
-        .send_payload(payload, false, TIMEOUT)
+        .send_packet(payload)
         .await
         .map_err(|error| Error::Transport(error.to_string()))?;
     Ok(())

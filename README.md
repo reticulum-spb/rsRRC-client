@@ -1,7 +1,8 @@
 # rsRRC-client
 
 Reusable asynchronous RRC client built on rsReticulum. It is intended for
-interactive clients, services, and bots.
+interactive clients, services, and bots. It is the RRC transport/session layer
+used by the adjacent `rsNomadNet` web client.
 
 The client supports multiple hubs, room join/part, messages, actions, commands,
 automatic PING/PONG handling, connection-state events, verified Reticulum
@@ -10,6 +11,10 @@ An application-level heartbeat detects a vanished hub without waiting for the
 much longer Reticulum Link stale timeout. Lost HELLO packets are retried, and a
 missing WELCOME causes a bounded reconnect instead of an indefinite
 `Waiting for WELCOME` state.
+Small RRC envelopes are queued as Link packets without waiting for a Reticulum
+delivery proof; RRC's own `WELCOME`, `JOINED`, `PARTED`, query replies, and
+events remain the authoritative application acknowledgements. This prevents a
+missing transport proof from stalling an otherwise accepted room operation.
 Each connected `Hub` exposes the parsed WELCOME version, capabilities and
 limits advertised by the server. Its `room_states` map tracks structured room
 registration, modes, and topics when the hub advertises the optional rsRRC
@@ -139,3 +144,10 @@ cargo run --example bot -- <hub-destination-hash> <rsReticulum-config-dir> <room
 
 It responds to `!ping` and `!who`. Production bots should load a persistent
 identity instead of the fresh identity used by this compact example.
+
+## Related projects
+
+- `rsRRC` defines and validates the shared RRC v1 wire format.
+- `rsRRCD` is the compatible Rust hub used by the live test suite.
+- `rsReticulum` provides Links, Resources, identities, and routing.
+- `rsNomadNet` provides the multi-hub Web UI and persistent chat history.
